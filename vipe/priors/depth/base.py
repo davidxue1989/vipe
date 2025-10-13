@@ -20,6 +20,8 @@ from enum import Enum
 import numpy as np
 import torch
 
+from vipe.utils.cameras import CameraType
+
 
 class DepthType(Enum):
     """
@@ -66,14 +68,15 @@ class DepthEstimationInput:
     - rgb: The source image ([B,], H, W, 3), should be within 0-1 float.
     - video_frame_list: The list of video frames (H, W, 3), should be within 0-1 float, length is T.
         we use numpy here mainly to enforce CPU tensor.
-    - focal_length: The focal length of the camera.
-        with a simple pinhole assumption where fx = fy and cx = w/2, cy = h/2.
+    - intrinsics: The intrinsics of the camera.
+    - camera_type: The type of camera.
     """
 
     rgb: torch.Tensor | None = None
     video_frame_list: list[np.ndarray] | None = None
     prompt_metric_depth: torch.Tensor | None = None
-    focal_length: float | None = None
+    intrinsics: torch.Tensor | None = None
+    camera_type: CameraType = CameraType.PINHOLE
 
 
 class DepthEstimationModel(ABC):
@@ -87,6 +90,13 @@ class DepthEstimationModel(ABC):
         Type of depth estimated.
         """
         raise NotImplementedError
+
+    @property
+    def supported_camera_types(self) -> list[CameraType]:
+        """
+        Supported camera types.
+        """
+        return [CameraType.PINHOLE]
 
     @abstractmethod
     def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:

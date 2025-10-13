@@ -24,6 +24,7 @@ from omegaconf import DictConfig, OmegaConf
 from vipe.ext.lietorch import SE3
 from vipe.priors.depth import make_depth_model
 from vipe.priors.depth.base import DepthType
+from vipe.priors.depth.adapter import PinholeDepthAdapter
 from vipe.streams.base import FrameAttribute, ProcessedVideoStream, StreamProcessor, VideoFrame, VideoStream
 from vipe.utils.cameras import CameraType
 from vipe.utils.logging import pbar
@@ -118,6 +119,9 @@ class SLAMSystem:
             This is currently not supported for now."""
 
             self.metric_depth = make_depth_model(self.config.keyframe_depth)
+            if self.config.camera_type not in self.metric_depth.supported_camera_types:
+                self.metric_depth = PinholeDepthAdapter(self.metric_depth)
+
             assert self.metric_depth.depth_type in [
                 DepthType.METRIC_DEPTH,
                 DepthType.MODEL_METRIC_DEPTH,

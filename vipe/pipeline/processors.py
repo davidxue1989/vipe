@@ -243,9 +243,8 @@ class AdaptiveDepthProcessor(StreamProcessor):
                 logger.info(f"Minimum UV score: {min_uv_score:.4f}")
 
             if min_uv_score < 0.3:
-                focal_length = frame.intrinsics[0].item()
                 prompt_result = self.depth_model.estimate(
-                    DepthEstimationInput(rgb=frame.rgb.float().cuda(), focal_length=focal_length)
+                    DepthEstimationInput(rgb=frame.rgb.float().cuda(), intrinsics=frame.intrinsics, camera_type=frame.camera_type)
                 ).metric_depth
                 frame.information = f"uv={min_uv_score:.2f}(Metric)"
             else:

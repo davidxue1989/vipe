@@ -22,6 +22,7 @@ except ModuleNotFoundError:
     MoGeModel = None
 
 from vipe.utils.misc import unpack_optional
+from vipe.utils.cameras import CameraType
 
 from .base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
 
@@ -52,8 +53,9 @@ class MogeModel(DepthEstimationModel):
     def estimate(self, src: DepthEstimationInput) -> DepthEstimationResult:
         rgb: torch.Tensor = unpack_optional(src.rgb)
         assert rgb.dtype == torch.float32, "Input image should be float32"
+        assert src.camera_type == CameraType.PINHOLE, "MoGe only supports pinhole cameras"
 
-        focal_length: float = unpack_optional(src.focal_length)
+        focal_length: float = unpack_optional(src.intrinsics)[0].item()
 
         if rgb.dim() == 3:
             rgb, batch_dim = rgb[None], False

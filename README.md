@@ -46,6 +46,13 @@ vipe infer YOUR_VIDEO.mp4
 
 ![vipe-vis](assets/vipe-vis.gif)
 
+Currently, we support the following pipeline configurations:
+- `default`: The default pipeline for pinhole cameras.
+- `lyra`: Configuration for results in the [Lyra](https://github.com/nv-tlabs/lyra) paper.
+- `no_vda`: If running video-depth-anything is too memory-consuming for you, this configuration can produce less temporally-stable depth (but empirically more 3D consistent) maps.
+- `wide_angle`: If your video contains some wide-angle or fisheye distortion.
+- `panorama`: For 360° videos, this is only available in the `panorama` branch for now.
+
 One can visualize the results that ViPE produces by running (supported by `viser`):
 ```bash
 vipe visualize vipe_results/
@@ -53,8 +60,6 @@ vipe visualize vipe_results/
 ```
 
 ![vipe-viser](assets/vipe-viser.gif)
-
-> We found that running [video-depth-anything](https://github.com/DepthAnything/Video-Depth-Anything) might eat up too much of GPU memory. To that end we provide a `no_vda` config that produces less temporally-stable depth (but empirically more 3D consistent) maps. This can be triggered by adding `--pipeline no_vda` to the `vipe infer` command.
 
 ### Using the `run.py` script
 
@@ -126,7 +131,7 @@ We thank useful discussions from Aigul Dzhumamuratova, Viktor Kuznetsov, Soha Po
 
 - [x] Initial code released under Apache 2.0 license.
 - [x] Full dataset uploaded to Hugging Face for download.
-- [ ] Add instructions to run inference on wide-angle and 360° videos.
+- [x] Add instructions to run inference on wide-angle and 360° videos.
 - [ ] Add instructions for benchmarking.
 
 ## Citation

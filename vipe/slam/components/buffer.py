@@ -255,10 +255,10 @@ class GraphBuffer:
         assert self.n_views == 1
 
         for frame_idx in frames_to_update:
-            focal_length = self.intrinsics[0][0].item()
             depth_input = DepthEstimationInput(
                 rgb=self.images[frame_idx].moveaxis(1, -1).float(),
-                focal_length=focal_length,
+                intrinsics=self.intrinsics[0],
+                camera_type=self.camera_type,
             )
             disp_sens = depth_model.estimate(depth_input).metric_depth
             disp_sens = disp_sens[:, 3::8, 3::8]

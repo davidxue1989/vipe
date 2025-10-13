@@ -18,6 +18,7 @@ from typing import Literal
 import torch
 
 from vipe.utils.misc import unpack_optional
+from vipe.utils.cameras import CameraType
 
 from ..base import DepthEstimationInput, DepthEstimationModel, DepthEstimationResult, DepthType
 from .models.unidepthv2.unidepthv2 import Pinhole, UniDepthV2
@@ -38,7 +39,8 @@ class UniDepth2Model(DepthEstimationModel):
         rgb: torch.Tensor = unpack_optional(src.rgb)
         assert rgb.dtype == torch.float32, "Input image should be float32"
 
-        focal_length: float = unpack_optional(src.focal_length)
+        assert src.camera_type == CameraType.PINHOLE, "UniDepth only supports pinhole cameras"
+        focal_length: float = unpack_optional(src.intrinsics)[0].item()
 
         if rgb.dim() == 3:
             rgb, batch_dim = rgb[None], False
