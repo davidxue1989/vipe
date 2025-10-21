@@ -61,7 +61,8 @@ def infer(video: Path, image_dir: Path, output: Path, pipeline: str, visualize: 
         overrides.append("pipeline.output.save_viz=true")
         overrides.append("pipeline.slam.visualize=true")
     else:
-        overrides.append("pipeline.output.save_viz=false")
+        # overrides.append("pipeline.output.save_viz=false")
+        overrides.append("pipeline.output.save_viz=true")
 
     # Set up stream configuration based on input type
     if image_dir:

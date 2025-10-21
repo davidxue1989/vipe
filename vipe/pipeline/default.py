@@ -69,7 +69,7 @@ class DefaultAnnotationPipeline(Pipeline):
         assert FrameAttribute.METRIC_DEPTH not in video_stream.attributes()
         assert FrameAttribute.INSTANCE not in video_stream.attributes()
 
-        init_processors.append(GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type))
+        init_processors.append(GeoCalibIntrinsicsProcessor(video_stream, camera_type=self.camera_type, slam_cfg=self.slam_cfg))
         if self.init_cfg.instance is not None:
             init_processors.append(
                 TrackAnythingProcessor(

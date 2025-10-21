@@ -40,7 +40,7 @@ logger = logging.getLogger(__name__)
 class IntrinsicEstimationProcessor(StreamProcessor):
     """Override existing intrinsics with estimated intrinsics."""
 
-    def __init__(self, video_stream: VideoStream, gap_sec: float = 1.0) -> None:
+    def __init__(self, video_stream: VideoStream, gap_sec: float = 1.0, slam_cfg = None) -> None:
         super().__init__()
         gap_frame = int(gap_sec * video_stream.fps())
         gap_frame = min(gap_frame, (len(video_stream) - 1) // 2)
@@ -48,17 +48,21 @@ class IntrinsicEstimationProcessor(StreamProcessor):
         self.fov_y = -1.0
         self.camera_type = CameraType.PINHOLE
         self.distortion: list[float] = []
+        self.slam_cfg = slam_cfg
 
     def update_attributes(self, previous_attributes: set[FrameAttribute]) -> set[FrameAttribute]:
         return previous_attributes | {FrameAttribute.INTRINSICS}
 
     def __call__(self, frame_idx: int, frame: VideoFrame) -> VideoFrame:
-        assert self.fov_y > 0, "FOV not set"
-        frame_height, frame_width = frame.size()
-        fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
-        frame.intrinsics = torch.as_tensor(
-            [fx, fy, frame_width / 2, frame_height / 2] + self.distortion,
-        ).float()
+        if self.slam_cfg is not None and self.slam_cfg['optimize_intrinsics']:
+            assert self.fov_y > 0, "FOV not set"
+            frame_height, frame_width = frame.size()
+            fx = fy = frame_height / (2 * np.tan(self.fov_y / 2))
+            frame.intrinsics = torch.as_tensor(
+                [fx, fy, frame_width / 2, frame_height / 2] + self.distortion,
+            ).float()
+        else:
+            frame.intrinsics = torch.as_tensor(self.slam_cfg['intrinsics_gt'] + self.slam_cfg['distortion_gt']).float()
         frame.camera_type = self.camera_type
         return frame
 
@@ -69,8 +73,9 @@ class GeoCalibIntrinsicsProcessor(IntrinsicEstimationProcessor):
         video_stream: VideoStream,
         gap_sec: float = 1.0,
         camera_type: CameraType = CameraType.PINHOLE,
+        slam_cfg = None,
     ) -> None:
-        super().__init__(video_stream, gap_sec)
+        super().__init__(video_stream, gap_sec, slam_cfg)
 
         is_pinhole = camera_type == CameraType.PINHOLE
         weights = "pinhole" if is_pinhole else "distorted"

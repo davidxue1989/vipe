@@ -6,7 +6,7 @@ instance: vipe.pipeline.default.DefaultAnnotationPipeline
 # Init configs
 init:
   camera_type: "pinhole"
-  intrinsics: "geocalib"
+  intrinsics: "gt"
   instance:
     kf_gap_sec: 2.0
     phrases: 
@@ -24,6 +24,8 @@ init:
 slam:
   keyframe_depth: unidepth-l
   optimize_intrinsics: ${neq:${..init.intrinsics},"gt"}
+  intrinsics_gt: [60.191658769356316, 60.190019859083165, 252.06325197648331, 259.3075348137081]
+  distortion_gt: []
 
 # Post-processing configs
 post:
