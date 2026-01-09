@@ -26,7 +26,8 @@ init:
     add_sky: true
 
 slam:
-  keyframe_depth: unidepth-l
+  # keyframe_depth: unidepth-l
+  keyframe_depth: dav3
   optimize_intrinsics: ${neq:${..init.intrinsics},"gt"}
   # intrinsics_gt: [535.4, 539.2, 320.1, 247.6] #TUM-RGBD
   # intrinsics_gt: [60.191658769356316, 60.190019859083165, 252.06325197648331, 259.3075348137081] #TUM-VI, balance = 0
@@ -37,7 +38,8 @@ slam:
 
 # Post-processing configs
 post:
-  depth_align_model: "adaptive_unidepth-l_svda"
+  depth_align_model: "mvd_dav3"
+  # depth_align_model: "adaptive_unidepth-l_svda"
   # depth_align_model: "adaptive_unidepth-l"
   # depth_align_model: null
 
