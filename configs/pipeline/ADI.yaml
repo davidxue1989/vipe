@@ -1,0 +1,61 @@
+defaults:
+  - /slam: default
+
+instance: vipe.pipeline.default.DefaultAnnotationPipeline
+
+# Init configs
+init:
+  camera_type: "pinhole"
+  intrinsics: "gt"
+  # intrinsics: "geocalib"
+  instance:
+    kf_gap_sec: 2.0
+    phrases: 
+      - shopping cart
+      - shopping bag
+      - hand bag
+      - person
+      - animal
+      - vehicle
+      - ball
+      - balloon
+      - gun
+      - pet
+      - car
+      - bus
+    add_sky: true
+
+slam:
+  # keyframe_depth: unidepth-l
+  keyframe_depth: dav3
+  optimize_intrinsics: ${neq:${..init.intrinsics},"gt"}
+  # intrinsics_gt: [535.4, 539.2, 320.1, 247.6] #TUM-RGBD
+  # intrinsics_gt: [60.191658769356316, 60.190019859083165, 252.06325197648331, 259.3075348137081] #TUM-VI, balance = 0
+  # intrinsics_gt: [58.877616, 58.876022, 252.149212, 259.235482] #TUM-VI, balance = 1
+  # intrinsics_gt: [611.4509887695312, 611.4857177734375, 433.2039794921875, 249.4730224609375] #OpenLORIS
+  distortion_gt: [] # vipe doesn't handle distortion yet for pinhole camera
+  
+
+# Post-processing configs
+post:
+  depth_align_model: "mvd_dav3"
+  # depth_align_model: "adaptive_unidepth-l_svda"
+  # depth_align_model: "adaptive_unidepth-l"
+  # depth_align_model: null
+
+# Output configs
+output:
+  # Path to save results
+  path: vipe_results/
+  skip_exists: false
+
+  # Save artifacts and a info file
+  save_artifacts: true
+
+  # Save reconstruction from SLAM
+  save_slam_map: false
+
+  # Visualization videos to BASE_PATH/vipe/xxx.mp4
+  save_viz: true
+  viz_downsample: 2
+  viz_attributes: [['rgb', 'instance'], ['depth', 'pcd']]
