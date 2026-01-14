@@ -33,8 +33,8 @@ slam:
   # intrinsics_gt: [60.191658769356316, 60.190019859083165, 252.06325197648331, 259.3075348137081] #TUM-VI, balance = 0
   # intrinsics_gt: [58.877616, 58.876022, 252.149212, 259.235482] #TUM-VI, balance = 1
   # intrinsics_gt: [611.4509887695312, 611.4857177734375, 433.2039794921875, 249.4730224609375] #OpenLORIS
-  # distortion_gt: []
-    
+  distortion_gt: [] # vipe doesn't handle distortion yet for pinhole camera
+  
 
 # Post-processing configs
 post:
