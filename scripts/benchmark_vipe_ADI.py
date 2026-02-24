@@ -1,39 +1,51 @@
 #!/usr/bin/env python3
 """
-OpenLORIS ViPE Runner & Benchmark (Python version)
+ADI ViPE Runner & Benchmark (Python version)
 
 This script processes visual odometry sequences through ViPE inference,
-converts outputs to TUM format, and optionally runs evo benchmarking.
+converts outputs to TUM format, optionally runs evo benchmarking, and
+uploads output to S3 for easy transfer to other devices.
 
 Supports both chunked sequences (images/part_XXXX/) and unchunked sequences.
+Reads camera intrinsics from camera_original.yaml when available.
 
 Example Usage:
 --------------
 # Basic run: infer only for sequences missing .npz, then post-process all:
-    python benchmark_vipe_ADI.py
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset -p ADI
 
-# Run with a specific pipeline and experiment name:
-    python benchmark_vipe_ADI.py -e OpenLORIS_gt_intr -p TUM-VI
+# Specify experiment name (used as S3 subfolder) and custom local output dir:
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset -p ADI \
+        -e adi_feb_2026 -o /home/ubuntu/results/vipe_adi_feb_2026
 
 # Process specific sequences only:
-    python benchmark_vipe_ADI.py --only cafe1-1 market1-1
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset --only seq1 seq2
 
 # Force re-inference for ALL sequences (even if .npz exists):
-    python benchmark_vipe_ADI.py --reprocess
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset --reprocess
 
 # Skip ALL inference, only post-process sequences that have .npz:
-    python benchmark_vipe_ADI.py --skip-infer
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset --skip-infer
 
 # Full example with custom paths and benchmarking:
-    python benchmark_vipe_ADI.py \
-        -e OpenLORIS_gt_intr \
-        -p TUM-VI \
-        --input-root ../data/OpenLORIS_dx/ \
-        --scale-all \
-        --bench-py ../rss-ros-envs/scripts/evo_benchmark/benchmark_dx.py
+    python scripts/benchmark_vipe_ADI.py \
+        -e adi_gt_intr \
+        -p ADI \
+        --input-root /home/ubuntu/data/ADI_data_feb_2026_extracted \
+        --scale-all
 
-# Open browser to view results:
-    python benchmark_vipe_ADI.py --browser
+# Disable S3 upload:
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset -p ADI --no-s3-upload
+
+# Upload existing results to S3 without re-processing:
+    python benchmark_vipe_ADI.py -e adi_feb_2026 -o /path/to/existing/output --upload-only
+
+# Use custom S3 settings:
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset -p ADI \
+        --s3-bucket my-bucket --s3-prefix my/prefix --s3-profile my-profile
+
+# Open browser to view benchmark results:
+    python benchmark_vipe_ADI.py --input-root /path/to/dataset --browser
 """
 import os
 import sys
@@ -48,6 +60,9 @@ import logging
 from datetime import datetime
 from pathlib import Path
 
+import hashlib
+import json
+
 import numpy as np
 import yaml
 import hydra
@@ -59,7 +74,7 @@ from vipe.utils.logging import configure_logging
 # -------------------------------------------------------------------------
 # CONSTANTS & DEFAULTS
 # -------------------------------------------------------------------------
-DEFAULT_ROOT_IN = "/home/dxue/workspaces/isaac_ros-dev/OpenLORIS_dx"
+DEFAULT_ROOT_IN = "/home/ubuntu/data/ADI_data_feb_2026_extracted"
 DEFAULT_BENCH_PY = "/home/dxue/workspaces/isaac_ros-dev/src/rss-ros-envs/scripts/evo_benchmark/benchmark_dx.py"
 ENV_VARS = os.environ.copy()
 # Set PyTorch allocation config to match bash script
@@ -68,6 +83,85 @@ ENV_VARS["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 # Setup logging to print to stderr/stdout
 logging.basicConfig(level=logging.INFO, format='%(message)s')
 logger = logging.getLogger(__name__)
+
+# -------------------------------------------------------------------------
+# S3 UPLOAD HELPERS
+# -------------------------------------------------------------------------
+
+def compute_file_md5(filepath):
+    """Compute MD5 hash of a file."""
+    hash_md5 = hashlib.md5()
+    with open(filepath, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            hash_md5.update(chunk)
+    return hash_md5.hexdigest()
+
+
+def s3_file_matches(local_path, bucket, key, profile):
+    """Check if S3 file matches local file (using ETag/MD5).
+
+    Returns True if files match (no upload needed), False otherwise.
+    """
+    try:
+        result = subprocess.run(
+            ["aws", "s3api", "head-object", "--bucket", bucket, "--key", key, "--profile", profile],
+            capture_output=True, text=True, timeout=30
+        )
+        if result.returncode != 0:
+            return False
+
+        metadata = json.loads(result.stdout)
+        etag = metadata.get('ETag', '').strip('"')
+
+        # Multipart uploads have ETags with '-' suffix; can't compare easily
+        if '-' in etag:
+            return False
+
+        local_md5 = compute_file_md5(local_path)
+        return local_md5 == etag
+    except Exception:
+        return False
+
+
+def upload_to_s3(local_dir, bucket, prefix, profile, timeout=1800):
+    """Upload a local directory to S3 using 'aws s3 sync'.
+
+    Returns True on success, False on failure.
+    """
+    s3_uri = f"s3://{bucket}/{prefix}"
+    logger.info(f"\nUploading output folder to S3...")
+    logger.info(f"  Local:   {local_dir}")
+    logger.info(f"  Bucket:  {bucket}")
+    logger.info(f"  Prefix:  {prefix}")
+    logger.info(f"  Profile: {profile}")
+
+    # Summarise what will be uploaded
+    files = []
+    for root, _dirs, fnames in os.walk(local_dir):
+        for fn in fnames:
+            files.append(os.path.join(root, fn))
+    total_size = sum(os.path.getsize(f) for f in files)
+    logger.info(f"  Files: {len(files)} ({total_size / (1024*1024):.1f} MB total)")
+
+    try:
+        result = subprocess.run(
+            ["aws", "s3", "sync", local_dir, s3_uri, "--profile", profile],
+            capture_output=True, text=True, timeout=timeout
+        )
+        if result.returncode == 0:
+            logger.info(f"  Upload successful!")
+            logger.info(f"  Download with: aws s3 sync {s3_uri} {os.path.basename(local_dir)} --profile {profile}")
+            return True
+        else:
+            logger.error(f"  Upload failed: {result.stderr}")
+            return False
+    except FileNotFoundError:
+        logger.error("  ERROR: AWS CLI not installed. Install with: pip install awscli")
+        return False
+    except Exception as e:
+        logger.error(f"  Upload error: {e}")
+        return False
+
 
 # -------------------------------------------------------------------------
 # MATH & CONVERSION HELPERS (Integrated from the embedded script)
@@ -350,9 +444,21 @@ def read_camera_intrinsics(seq_dir):
         logger.warning(f"Failed to read camera_original.yaml: {e}")
         return None, None
 
-def run_vipe_inference(img_dir, raw_dir, pipeline, visualize, seq_dir):
+def run_vipe_inference(img_dir, raw_dir, pipeline, visualize, seq_dir, no_override_intrinsics=False):
     """
     Run ViPE inference directly using the Python API.
+    
+    Args:
+        img_dir: Path to the image directory for this sequence/chunk.
+        raw_dir: Path to write ViPE raw outputs.
+        pipeline: Name of the ViPE pipeline config (e.g. "ADI").
+        visualize: Whether to enable ViPE visualization.
+        seq_dir: Path to the sequence directory (used to find camera_original.yaml).
+        no_override_intrinsics: If True, do NOT override intrinsics_gt in the
+            pipeline config with values from camera_original.yaml. The pipeline
+            config values (or lack thereof) will be used as-is. Default False
+            (YAML intrinsics override config when available).
+    
     Returns True on success, False on failure.
     """
     try:
@@ -366,29 +472,38 @@ def run_vipe_inference(img_dir, raw_dir, pipeline, visualize, seq_dir):
             "pipeline.output.save_artifacts=true"
         ]
         
-        # Check if pipeline config already has intrinsics_gt/distortion_gt
-        # Only override if they're not already set in the pipeline config
+        # Check if pipeline config already has intrinsics_gt
         with hydra.initialize_config_dir(config_dir=str(get_config_path()), version_base=None):
             base_cfg = hydra.compose("default", overrides=[f"pipeline={pipeline}"])
         
         has_intrinsics_gt = hasattr(base_cfg.pipeline.slam, 'intrinsics_gt') and base_cfg.pipeline.slam.intrinsics_gt is not None
-        has_distortion_gt = hasattr(base_cfg.pipeline.slam, 'distortion_gt') and base_cfg.pipeline.slam.distortion_gt is not None
         
-        # Add intrinsics if found and not already in config (format: [fx, fy, cx, cy])
-        if intrinsics is not None and not has_intrinsics_gt:
+        # Intrinsics override logic:
+        #   --no-override-intrinsics: never inject YAML intrinsics; use pipeline config as-is
+        #   default:                  YAML intrinsics override config (use + if key missing,
+        #                             plain override if key exists)
+        if no_override_intrinsics:
+            if intrinsics is not None:
+                logger.info(f"Intrinsics found in camera_original.yaml but --no-override-intrinsics is set; using pipeline config as-is")
+        elif intrinsics is not None:
             intrinsics_str = "[" + ",".join(str(v) for v in intrinsics) + "]"
-            # Use + prefix to add new config key since it doesn't exist
-            overrides.append(f"+pipeline.slam.intrinsics_gt={intrinsics_str}")
-            logger.info(f"Using intrinsics from camera_original.yaml: {intrinsics_str}")
+            if has_intrinsics_gt:
+                # Key already exists in config — plain override replaces it
+                overrides.append(f"pipeline.slam.intrinsics_gt={intrinsics_str}")
+                logger.info(f"Overriding config intrinsics_gt with camera_original.yaml: {intrinsics_str}")
+            else:
+                # Key does not exist in config — use + prefix to add it
+                overrides.append(f"+pipeline.slam.intrinsics_gt={intrinsics_str}")
+                logger.info(f"Adding intrinsics_gt from camera_original.yaml: {intrinsics_str}")
+        else:
+            if has_intrinsics_gt:
+                logger.info(f"No camera_original.yaml intrinsics; using pipeline config intrinsics_gt")
+            else:
+                logger.warning(f"No intrinsics found in camera_original.yaml or pipeline config")
         
-        # Note: ViPE's pinhole camera model does NOT support distortion coefficients
-        # The SLAM system expects only [fx, fy, cx, cy] for pinhole cameras
-        # Distortion coefficients from camera_original.yaml are ignored
-        # if distortion is not None and not has_distortion_gt:
-        #     distortion_str = "[" + ",".join(str(d) for d in distortion) + "]"
-        #     # Use + prefix to add new config key since it doesn't exist
-        #     overrides.append(f"+pipeline.slam.distortion_gt={distortion_str}")
-        #     logger.info(f"Using distortion from camera_original.yaml: {distortion_str}")
+        # Note: ViPE's pinhole camera model does NOT support distortion coefficients.
+        # The SLAM system expects only [fx, fy, cx, cy] for pinhole cameras.
+        # Distortion coefficients from camera_original.yaml are intentionally ignored.
         
         if visualize:
             overrides.append("pipeline.output.save_viz=true")
@@ -425,13 +540,17 @@ def run_vipe_inference(img_dir, raw_dir, pipeline, visualize, seq_dir):
 # -------------------------------------------------------------------------
 # MAIN LOGIC
 # -------------------------------------------------------------------------
-# python ./processing_scripts/benchmark_vipe_ADI.py -e adi_vipe_gt_intrin -p ADI --input-root /home/ubuntu/data/ADI_dataset_extracted --scale-all --bench-py ../rss-ros-envs/scripts/evo_benchmark/benchmark_dx.py
 def main():
-    parser = argparse.ArgumentParser(description="OpenLORIS ViPE Runner & Benchmark")
-    parser.add_argument('-e', '--expname', default="", help="Experiment name suffix")
+    parser = argparse.ArgumentParser(description="ADI ViPE Runner & Benchmark")
+    parser.add_argument('-e', '--expname', default="",
+                        help='Experiment name used as the S3 subfolder under --s3-prefix '
+                             '(e.g. s3://<bucket>/lab-data/vipe-results/<expname>/). '
+                             'Falls back to the local output directory name if not set.')
     parser.add_argument('-p', '--pipeline', default="ADI", help="ViPE pipeline config name")
     parser.add_argument('-v', '--vis', '--visualize', action='store_true', dest='visualize', help="Enable ViPE visualization")
     parser.add_argument('--input-root', default=DEFAULT_ROOT_IN, help="Input dataset root")
+    parser.add_argument('-o', '--output-dir', default='./output_vipe',
+                        help='Local output directory path (default: ./output_vipe)')
     parser.add_argument('--only', nargs='+', default=[], help="Process only these sequence names")
     parser.add_argument('--only-file', help="File containing list of sequences to process")
     parser.add_argument('--skip', nargs='+', default=[], help="Skip these sequence names")
@@ -452,15 +571,46 @@ def main():
     parser.add_argument('--plots', action='store_true', dest='show_plots', help="Pass --plots to benchmark script")
     parser.add_argument('--scale-all', action='store_true', help="Pass --scale-all to benchmark script")
 
+    # Intrinsics override control
+    parser.add_argument('--no-override-intrinsics', action='store_true', dest='no_override_intrinsics',
+                        help='Do NOT override pipeline config intrinsics_gt with values from '
+                             'camera_original.yaml. By default (flag absent), per-sequence YAML '
+                             'intrinsics take priority over the pipeline config.')
+
+    # S3 upload options
+    parser.add_argument('--no-s3-upload', action='store_true',
+                        help='Disable S3 upload of output folder')
+    parser.add_argument('--s3-bucket', default='rss-slam',
+                        help='S3 bucket name for upload (default: rss-slam)')
+    parser.add_argument('--s3-prefix', default='lab-data/vipe-results',
+                        help='S3 key prefix/folder (default: lab-data/vipe-results)')
+    parser.add_argument('--s3-profile', default='rss',
+                        help='AWS CLI profile for S3 upload (default: rss)')
+    parser.add_argument('--upload-only', action='store_true',
+                        help='Skip processing, just upload existing output folder to S3')
+
     args = parser.parse_args()
 
     # 1. Output Roots
+    # If --expname is set, append it to the output dir (e.g. ./output_vipe/adi_gt_intr/)
+    # so both local and S3 paths use the same experiment name.
     if args.expname:
-        root_out = f"./output_vipe_{args.expname}"
+        root_out = os.path.join(args.output_dir, args.expname)
     else:
-        root_out = "./output_vipe"
+        root_out = args.output_dir
+    s3_expname = args.expname if args.expname else os.path.basename(os.path.abspath(root_out))
     
     dest_root = os.path.join(root_out, "poses_and_groundtruth")
+
+    # Handle --upload-only: skip all processing, just upload existing output
+    if args.upload_only:
+        if not os.path.isdir(root_out):
+            logger.error(f"Output directory not found: {root_out}")
+            sys.exit(1)
+        s3_prefix = f"{args.s3_prefix}/{s3_expname}"
+        success = upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
+        sys.exit(0 if success else 1)
+
     os.makedirs(root_out, exist_ok=True)
     os.makedirs(dest_root, exist_ok=True)
 
@@ -489,6 +639,7 @@ def main():
     logger.info(f"[INFO] Benchmark py: {args.bench_py}")
     logger.info(f"[INFO] Open browser: {'ON' if args.browser else 'OFF'}")
     logger.info(f"[INFO] Scale-all APE: {'ON' if args.scale_all else 'OFF'}")
+    logger.info(f"[INFO] S3 upload: {'OFF' if args.no_s3_upload else 'ON'} (bucket={args.s3_bucket}, prefix={args.s3_prefix}, profile={args.s3_profile})")
     logger.info(f"[INFO] PYTORCH_CUDA_ALLOC_CONF={ENV_VARS.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
     logger.info(f"[INFO] Scanning for sequences with required files ...")
 
@@ -592,7 +743,7 @@ def main():
                     log_msg(f"[RUN] Running ViPE inference on {part_dir}")
                     
                     try:
-                        success = run_vipe_inference(part_dir, raw_part, args.pipeline, args.visualize, seq_dir)
+                        success = run_vipe_inference(part_dir, raw_part, args.pipeline, args.visualize, seq_dir, args.no_override_intrinsics)
                         if not success:
                             log_msg(f"[WARN] ViPE inference failed")
                             with open(part_log, "a") as plog:
@@ -712,7 +863,7 @@ def main():
                 start_epoch = time.time()
                 
                 try:
-                    success = run_vipe_inference(img_dir, raw_dir, args.pipeline, args.visualize, seq_dir)
+                    success = run_vipe_inference(img_dir, raw_dir, args.pipeline, args.visualize, seq_dir, args.no_override_intrinsics)
                     if not success:
                         log_msg(f"[WARN] ViPE inference failed")
                 except Exception as e:
@@ -790,6 +941,13 @@ def main():
             print(f"No HTML results found in {dest_root}")
     else:
         print(f"Benchmark script not found at {args.bench_py} - skipping.")
+
+    # 5. S3 Upload (enabled by default, runs after benchmarking so results are included)
+    if not args.no_s3_upload:
+        s3_prefix = f"{args.s3_prefix}/{s3_expname}"
+        upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
+    else:
+        logger.info("[INFO] S3 upload disabled (--no-s3-upload).")
 
 if __name__ == "__main__":
     main()
