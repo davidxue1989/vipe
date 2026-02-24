@@ -75,7 +75,6 @@ from vipe.utils.logging import configure_logging
 # CONSTANTS & DEFAULTS
 # -------------------------------------------------------------------------
 DEFAULT_ROOT_IN = "/home/ubuntu/data/ADI_data_feb_2026_extracted"
-DEFAULT_BENCH_PY = "/home/dxue/workspaces/isaac_ros-dev/src/rss-ros-envs/scripts/evo_benchmark/benchmark_dx.py"
 ENV_VARS = os.environ.copy()
 # Set PyTorch allocation config to match bash script
 ENV_VARS["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
@@ -161,6 +160,325 @@ def upload_to_s3(local_dir, bucket, prefix, profile, timeout=1800):
     except Exception as e:
         logger.error(f"  Upload error: {e}")
         return False
+
+
+def upload_sequence_to_s3(seq_out_dir, bucket, prefix, profile, seq_name, logger):
+    """Upload a single sequence's output folder to S3 immediately after processing.
+
+    This is called per-sequence so results are available as soon as they finish,
+    rather than waiting for the entire run to complete.
+    """
+    s3_uri = f"s3://{bucket}/{prefix}/{seq_name}"
+    local_dir = seq_out_dir
+    if not os.path.isdir(local_dir):
+        return
+    # Count files and total size for visibility
+    files = []
+    for root, _dirs, fnames in os.walk(local_dir):
+        for fn in fnames:
+            files.append(os.path.join(root, fn))
+    total_size = sum(os.path.getsize(f) for f in files)
+    logger.info(f"  [S3] Syncing {seq_name} -> {s3_uri}  ({len(files)} files, {total_size / (1024*1024):.1f} MB)")
+    try:
+        result = subprocess.run(
+            ["aws", "s3", "sync", local_dir, s3_uri, "--profile", profile],
+            capture_output=True, text=True, timeout=600
+        )
+        if result.returncode == 0:
+            # Count how many files were actually uploaded (not already in sync)
+            uploaded = [l for l in result.stdout.strip().splitlines() if l.strip()] if result.stdout else []
+            if uploaded:
+                logger.info(f"  [S3] Done — {len(uploaded)} file(s) transferred")
+            else:
+                logger.info(f"  [S3] Done — already in sync")
+        else:
+            logger.warning(f"  [S3] Upload failed for {seq_name}: {result.stderr.strip()}")
+    except Exception as e:
+        logger.warning(f"  [S3] Upload error for {seq_name}: {e}")
+
+
+# -------------------------------------------------------------------------
+# EVO EVALUATION HELPERS
+# -------------------------------------------------------------------------
+
+def setup_evo_backend():
+    """Configure evo to use a non-interactive matplotlib backend."""
+    try:
+        import matplotlib
+        matplotlib.use('Agg')
+    except ImportError:
+        pass
+    try:
+        result = subprocess.run(
+            ["evo_config", "set", "plot_backend", "Agg"],
+            capture_output=True, text=True, timeout=10
+        )
+    except FileNotFoundError:
+        logger.debug("evo_config not found (evo tools not installed?)")
+    except Exception as e:
+        logger.debug(f"evo_config: {e}")
+
+
+def parse_ape_output(output):
+    """Parse evo_ape output to extract metrics.
+
+    Args:
+        output: Combined stdout+stderr from evo_ape
+
+    Returns:
+        dict with metric names and values
+    """
+    metrics = {}
+    patterns = {
+        'max': r'max\s+([\d.]+)',
+        'mean': r'mean\s+([\d.]+)',
+        'median': r'median\s+([\d.]+)',
+        'min': r'min\s+([\d.]+)',
+        'rmse': r'rmse\s+([\d.]+)',
+        'sse': r'sse\s+([\d.]+)',
+        'std': r'std\s+([\d.]+)',
+        'scale': r'[Ss]cale\s+correction[:\s]+([\d.]+)',
+        'pairs': r'[Cc]ompared\s+(\d+)\s+absolute\s+pose\s+pairs',
+    }
+    for key, pattern in patterns.items():
+        match = re.search(pattern, output)
+        if match:
+            metrics[key] = float(match.group(1)) if key != 'pairs' else int(match.group(1))
+    return metrics
+
+
+def run_evo_evaluation(output_dir, scale_correction=False, seq_name=''):
+    """Run evo trajectory evaluation (evo_traj + evo_ape) on a single sequence.
+
+    Looks for groundtruth.txt and vipe_estimate_tum.txt in *output_dir*,
+    generates trajectory plots and APE metrics, and saves evo_metrics.json.
+
+    Args:
+        output_dir: Directory containing groundtruth.txt and vipe_estimate_tum.txt
+        scale_correction: If True, enable scale correction in evo_ape (-s flag)
+        seq_name: Sequence name for log messages
+
+    Returns:
+        dict with APE metrics, or None if evaluation failed
+    """
+    groundtruth = os.path.join(output_dir, 'groundtruth.txt')
+    odometry = os.path.join(output_dir, 'vipe_estimate_tum.txt')
+
+    label = seq_name or os.path.basename(output_dir)
+
+    # Check required files exist
+    if not os.path.isfile(groundtruth):
+        logger.info(f"  [EVO] Skipping {label} — groundtruth.txt not found")
+        return None
+    if not os.path.isfile(odometry):
+        logger.info(f"  [EVO] Skipping {label} — vipe_estimate_tum.txt not found")
+        return None
+
+    # Check files have data (more than just comment header)
+    for path, name in [(groundtruth, 'groundtruth.txt'), (odometry, 'vipe_estimate_tum.txt')]:
+        with open(path, 'r') as f:
+            data_lines = [l for l in f if not l.startswith('#') and l.strip()]
+        if not data_lines:
+            logger.info(f"  [EVO] Skipping {label} — {name} is empty")
+            return None
+
+    logger.info(f"  [EVO] Running evo evaluation for {label}")
+
+    # Remove stale plot files to avoid interactive prompts
+    for pat in ('evo_plot.png', 'evo_plot_trajectories.png', 'evo_plot_xyz.png',
+                'evo_plot_rpy.png', 'evo_plot_speeds.png'):
+        p = os.path.join(output_dir, pat)
+        if os.path.exists(p):
+            os.remove(p)
+
+    # --- evo_traj: generate trajectory plot ---
+    plot_path = os.path.join(output_dir, 'evo_plot.png')
+    traj_flags = "-as" if scale_correction else "-a"
+    traj_cmd = [
+        "evo_traj", "tum", traj_flags,
+        "--save_plot", plot_path,
+        "--ref", groundtruth,
+        odometry,
+        "--t_max_diff", "0.1"
+    ]
+    try:
+        result = subprocess.run(traj_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            logger.info(f"  [EVO] Generated: {plot_path}")
+        else:
+            logger.warning(f"  [EVO] evo_traj failed: {result.stderr[:200]}")
+    except FileNotFoundError:
+        logger.warning("  [EVO] evo_traj not found (evo tools not installed?)")
+    except Exception as e:
+        logger.warning(f"  [EVO] evo_traj error: {e}")
+
+    # --- evo_ape: compute APE metrics ---
+    ape_flags = "-avs" if scale_correction else "-av"
+    ape_cmd = [
+        "evo_ape", "tum", ape_flags,
+        groundtruth, odometry,
+        "--t_max_diff", "0.1"
+    ]
+    try:
+        result = subprocess.run(ape_cmd, capture_output=True, text=True, timeout=60)
+        if result.returncode == 0:
+            metrics = parse_ape_output(result.stdout + result.stderr)
+            metrics['folder'] = label
+
+            # Print summary
+            logger.info(f"  [EVO] APE Metrics for {label}:")
+            for k in ('rmse', 'mean', 'median', 'std', 'min', 'max', 'scale', 'pairs'):
+                v = metrics.get(k)
+                if v is not None:
+                    logger.info(f"         {k:>7s}: {v}")
+
+            # Save metrics to JSON
+            metrics_path = os.path.join(output_dir, 'evo_metrics.json')
+            with open(metrics_path, 'w') as f:
+                json.dump(metrics, f, indent=2)
+            logger.info(f"  [EVO] Saved: {metrics_path}")
+
+            return metrics
+        else:
+            logger.warning(f"  [EVO] evo_ape failed: {result.stderr[:200]}")
+            return None
+    except FileNotFoundError:
+        logger.warning("  [EVO] evo_ape not found (evo tools not installed?)")
+        return None
+    except Exception as e:
+        logger.warning(f"  [EVO] evo_ape error: {e}")
+        return None
+
+
+# -------------------------------------------------------------------------
+# SUMMARY TABLE HELPERS
+# -------------------------------------------------------------------------
+
+def compute_averages(all_results):
+    """Compute average metrics from all results."""
+    if not all_results:
+        return {}
+    n = len(all_results)
+    avg = {}
+    for key in ('rmse', 'mean', 'median', 'std', 'min', 'max'):
+        vals = [r.get(key, 0) for r in all_results]
+        avg[key] = sum(vals) / n
+    # Scale: average only those that have it
+    scales = [r['scale'] for r in all_results if r.get('scale')]
+    avg['scale'] = sum(scales) / len(scales) if scales else 0
+    # Pairs: total
+    avg['pairs'] = sum(r.get('pairs', 0) for r in all_results)
+    return avg
+
+
+def print_summary_table(all_results):
+    """Print a console summary table of APE metrics."""
+    print("\n" + "=" * 130)
+    print("APE METRICS SUMMARY TABLE")
+    print("=" * 130)
+
+    if not all_results:
+        print("No results collected!")
+        return
+
+    header = f"{'Folder':<55} {'RMSE':>10} {'Mean':>10} {'Median':>10} {'Std':>10} {'Min':>10} {'Max':>10} {'Scale':>10} {'Pairs':>8}"
+    print(header)
+    print("-" * 130)
+
+    for r in all_results:
+        scale_str = f"{r['scale']:>10.4f}" if r.get('scale') else "       N/A"
+        pairs_str = f"{r['pairs']:>8}" if r.get('pairs') else "     N/A"
+        print(
+            f"{r.get('folder','N/A'):<55} "
+            f"{r.get('rmse',0):>10.4f} "
+            f"{r.get('mean',0):>10.4f} "
+            f"{r.get('median',0):>10.4f} "
+            f"{r.get('std',0):>10.4f} "
+            f"{r.get('min',0):>10.4f} "
+            f"{r.get('max',0):>10.4f} "
+            f"{scale_str} "
+            f"{pairs_str}"
+        )
+
+    print("-" * 130)
+    avgs = compute_averages(all_results)
+    print(
+        f"{'AVERAGE':>55} "
+        f"{avgs['rmse']:>10.4f} "
+        f"{avgs['mean']:>10.4f} "
+        f"{avgs['median']:>10.4f} "
+        f"{avgs['std']:>10.4f} "
+        f"{avgs['min']:>10.4f} "
+        f"{avgs['max']:>10.4f} "
+        f"{avgs.get('scale',0):>10.4f} "
+        f"{avgs.get('pairs',0):>8}"
+    )
+    print("=" * 130)
+
+
+def save_html_table(all_results, output_path):
+    """Save APE metrics as an HTML table."""
+    html = '''<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8">
+    <title>ViPE APE Metrics Summary</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; background: #fff; color: #000; }
+        h1 { color: #000; }
+        table { border-collapse: collapse; width: 100%; background: white; box-shadow: 0 2px 5px rgba(0,0,0,0.1); }
+        th, td { border: 1px solid #333; padding: 10px; text-align: right; color: #000; }
+        th { background: #2563eb; color: white; }
+        td:first-child { text-align: left; font-family: monospace; font-size: 0.9em; }
+        tr:nth-child(even) { background: #f0f0f0; }
+        tr:hover { background: #e0e0e0; }
+        tr.average { background: #d4edda; font-weight: bold; }
+        tr.average:hover { background: #c3e6cb; }
+        .timestamp { color: #000; font-size: 0.9em; margin-bottom: 20px; }
+    </style>
+</head>
+<body>
+    <h1>ViPE APE Metrics Summary</h1>
+    <p class="timestamp">Generated: TIMESTAMP</p>
+    <table>
+        <tr>
+            <th>Sequence</th>
+            <th>RMSE</th><th>Mean</th><th>Median</th><th>Std</th>
+            <th>Min</th><th>Max</th><th>Scale</th><th>Pairs</th>
+        </tr>
+'''.replace('TIMESTAMP', datetime.now().strftime('%Y-%m-%d %H:%M:%S'))
+
+    if all_results:
+        for r in all_results:
+            scale_html = f"{r['scale']:.4f}" if r.get('scale') else "N/A"
+            pairs_html = str(r['pairs']) if r.get('pairs') else "N/A"
+            html += f'''        <tr>
+            <td>{r.get('folder','N/A')}</td>
+            <td>{r.get('rmse',0):.4f}</td><td>{r.get('mean',0):.4f}</td>
+            <td>{r.get('median',0):.4f}</td><td>{r.get('std',0):.4f}</td>
+            <td>{r.get('min',0):.4f}</td><td>{r.get('max',0):.4f}</td>
+            <td>{scale_html}</td><td>{pairs_html}</td>
+        </tr>
+'''
+        avgs = compute_averages(all_results)
+        html += f'''        <tr class="average">
+            <td>AVERAGE / TOTAL</td>
+            <td>{avgs['rmse']:.4f}</td><td>{avgs['mean']:.4f}</td>
+            <td>{avgs['median']:.4f}</td><td>{avgs['std']:.4f}</td>
+            <td>{avgs['min']:.4f}</td><td>{avgs['max']:.4f}</td>
+            <td>{avgs.get('scale',0):.4f}</td><td>{avgs.get('pairs',0)}</td>
+        </tr>
+'''
+    else:
+        html += '        <tr><td colspan="9">No results collected!</td></tr>\n'
+
+    html += '''    </table>
+</body>
+</html>
+'''
+    with open(output_path, 'w') as f:
+        f.write(html)
+    logger.info(f"  HTML table saved to: {output_path}")
 
 
 # -------------------------------------------------------------------------
@@ -366,6 +684,7 @@ def run_command_with_tee(cmd, log_file, env=None, verbose=True):
     Returns the exit code.
     """
     with open(log_file, "a") as f:
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] >>> {' '.join(cmd)}\n")
         process = subprocess.Popen(
             cmd,
             stdout=subprocess.PIPE,
@@ -375,10 +694,12 @@ def run_command_with_tee(cmd, log_file, env=None, verbose=True):
             bufsize=1  # Line buffered
         )
         for line in process.stdout:
-            f.write(line)
+            ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            f.write(f"[{ts}] {line}")
             if verbose:
                 print(line, end='', flush=True)
         process.wait()
+        f.write(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] <<< exit code {process.returncode}\n")
         return process.returncode
 
 def get_chunk_ids(seq_dir):
@@ -538,9 +859,502 @@ def run_vipe_inference(img_dir, raw_dir, pipeline, visualize, seq_dir, no_overri
         return False
 
 # -------------------------------------------------------------------------
-# MAIN LOGIC
+# SEQUENCE PROCESSING
 # -------------------------------------------------------------------------
-def main():
+
+def make_log_fn(log_file_path):
+    """Create a logging function that prints to stdout and appends to a log file."""
+    def log_msg(msg):
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        stamped = f"[{ts}] {msg}"
+        print(stamped)
+        with open(log_file_path, "a") as f:
+            f.write(stamped + "\n")
+    return log_msg
+
+
+def should_run_inference(npz_path, skip_infer, reprocess):
+    """Decide whether inference should run for a given sequence or chunk.
+
+    Returns True if inference should run, False otherwise.
+    """
+    if skip_infer:
+        return False
+    if reprocess:
+        return True
+    return npz_path is None
+
+
+def process_chunk(cid, img_dir, seq_dir, seq_name, raw_dir, out_seq_dir, args, log_msg):
+    """Process a single chunk: run inference (if needed) and convert to TUM.
+
+    Returns the path to the partial TUM file if successful, else None.
+    """
+    part_dir = os.path.join(img_dir, f"part_{cid}")
+    tsc = os.path.join(seq_dir, f"timestamp_{cid}.csv")
+
+    if not os.path.isdir(part_dir) or not os.path.isfile(tsc):
+        log_msg(f"[WARN] Missing inputs for chunk {cid}, skipping.")
+        return None
+
+    raw_part = os.path.join(raw_dir, f"part_{cid}")
+    os.makedirs(raw_part, exist_ok=True)
+    part_log = os.path.join(out_seq_dir, f"vipe_infer_part_{cid}.log")
+    Path(part_log).touch()
+
+    npz_path = find_pose_npz(raw_part)
+
+    if should_run_inference(npz_path, args.skip_infer, args.reprocess):
+        start_human = datetime.now().isoformat()
+        start_epoch = time.time()
+
+        with open(part_log, "a") as plog:
+            plog.write(f"[TIME] start={start_human} epoch={int(start_epoch)}\n")
+            plog.write(f"[ENV ] PYTORCH_CUDA_ALLOC_CONF={ENV_VARS.get('PYTORCH_CUDA_ALLOC_CONF', '')}\n")
+            plog.write(f"[RUN]  Running ViPE inference on {part_dir}\n")
+
+        log_msg(f"[RUN] Running ViPE inference on {part_dir}")
+
+        try:
+            success = run_vipe_inference(
+                part_dir, raw_part, args.pipeline, args.visualize,
+                seq_dir, args.no_override_intrinsics,
+            )
+            if not success:
+                log_msg(f"[WARN] ViPE inference failed")
+                with open(part_log, "a") as plog:
+                    plog.write(f"[WARN] ViPE inference failed\n")
+        except Exception as e:
+            with open(part_log, "a") as plog:
+                plog.write(f"[ERR] Exception during inference: {e}\n")
+            log_msg(f"[ERR] Exception during inference: {e}")
+
+        end_human = datetime.now().isoformat()
+        end_epoch = time.time()
+        dur = int(end_epoch - start_epoch)
+        with open(part_log, "a") as plog:
+            plog.write(f"[TIME] end={end_human} epoch={int(end_epoch)} duration_s={dur}\n")
+        log_msg(f"[TIME] Completed in {dur}s")
+
+        npz_path = find_pose_npz(raw_part)
+    else:
+        if args.skip_infer:
+            msg = f"[SKIP] part_{cid} infer: --skip-infer specified"
+        elif npz_path:
+            msg = f"[SKIP] part_{cid} infer: npz exists ({npz_path}); use --reprocess to force"
+        else:
+            msg = f"[SKIP] part_{cid} infer: no npz and inference not requested"
+        log_msg(msg)
+        with open(part_log, "a") as plog:
+            plog.write(msg + "\n")
+
+    # Convert to TUM
+    partial_out = os.path.join(out_seq_dir, f"vipe_estimate_tum_part_{cid}.txt")
+    if npz_path:
+        if args.reprocess or not os.path.exists(partial_out):
+            log_msg(f"[PRED-part] Convert {npz_path} -> {partial_out}")
+            success = convert_npz_to_tum(
+                npz_path, tsc, partial_out, args.poses_kind,
+                f"{seq_name}:part_{cid}",
+            )
+            if not success:
+                log_msg(f"[WARN] part_{cid} conversion failed.")
+        else:
+            with open(part_log, "a") as plog:
+                plog.write(f"[SKIP] conversion: {partial_out} exists\n")
+    else:
+        with open(part_log, "a") as plog:
+            plog.write(f"[WARN] No npz to convert for part_{cid}\n")
+
+    return partial_out if (npz_path and os.path.exists(partial_out)) else None
+
+
+def stitch_chunks(chunk_ids, out_seq_dir, seq_name, gt_txt, reprocess, log_msg):
+    """Stitch per-chunk TUM files into a single prediction and copy groundtruth.
+
+    Returns the path to the stitched prediction file, or None if nothing was stitched.
+    """
+    # Copy groundtruth
+    gt_tum = os.path.join(out_seq_dir, "groundtruth.txt")
+    if reprocess or not os.path.exists(gt_tum):
+        log_msg(f"[GT] Copy {gt_txt} -> {gt_tum}")
+        shutil.copy2(gt_txt, gt_tum)
+    else:
+        log_msg(f"[SKIP] groundtruth.txt already exists")
+
+    pred_out = os.path.join(out_seq_dir, "vipe_estimate_tum.txt")
+
+    with open(pred_out, "w") as fout:
+        fout.write("# ViPE predicted trajectory (TUM format)\n")
+        fout.write(f"# sequence: '{seq_name}' (stitched)\n")
+        fout.write("# columns: timestamp tx ty tz qx qy qz qw\n")
+
+        appended_count = 0
+        all_lines = []
+        for cid in chunk_ids:
+            part_f = os.path.join(out_seq_dir, f"vipe_estimate_tum_part_{cid}.txt")
+            if os.path.exists(part_f):
+                with open(part_f, "r") as fin:
+                    for line in fin:
+                        if not line.startswith('#'):
+                            all_lines.append(line.strip())
+                appended_count += 1
+            else:
+                log_msg(f"[WARN] Missing partial file for part_{cid}")
+
+        # Monotonic sort by timestamp
+        parsed_lines = []
+        for l in all_lines:
+            parts = l.split()
+            if parts:
+                try:
+                    parsed_lines.append((float(parts[0]), l))
+                except ValueError:
+                    pass
+
+        parsed_lines.sort(key=lambda x: x[0])
+        for _, line in parsed_lines:
+            fout.write(line + "\n")
+
+    if appended_count > 0:
+        log_msg(f"[OK] Stitched {appended_count} chunk(s) into {pred_out}")
+        return pred_out
+    else:
+        log_msg(f"[WARN] No partial predictions stitched for {seq_name}; final prediction missing.")
+        try:
+            os.remove(pred_out)
+        except OSError:
+            pass
+        return None
+
+
+def process_chunked_sequence(seq_name, seq_dir, img_dir, gt_txt, raw_dir, out_seq_dir, args, log_msg):
+    """Run the full chunked-sequence pipeline: per-chunk inference + stitch."""
+    log_msg("[MODE] Chunked sequence detected.")
+    chunk_ids = get_chunk_ids(seq_dir)
+    if not chunk_ids:
+        log_msg(f"[ERR] No timestamp_*.csv found despite part folders. Skipping.")
+        return False
+
+    for cid in chunk_ids:
+        process_chunk(cid, img_dir, seq_dir, seq_name, raw_dir, out_seq_dir, args, log_msg)
+
+    stitch_chunks(chunk_ids, out_seq_dir, seq_name, gt_txt, args.reprocess, log_msg)
+    return True
+
+
+def process_unchunked_sequence(seq_name, seq_dir, img_dir, ts_csv, gt_txt, raw_dir, out_seq_dir, args, log_msg):
+    """Run the full unchunked-sequence pipeline: inference + convert."""
+    log_msg("[MODE] Unchunked sequence.")
+
+    npz_path = find_pose_npz(raw_dir)
+
+    if should_run_inference(npz_path, args.skip_infer, args.reprocess):
+        log_msg(f"[RUN] Running ViPE inference on {img_dir}")
+        start_epoch = time.time()
+
+        try:
+            success = run_vipe_inference(
+                img_dir, raw_dir, args.pipeline, args.visualize,
+                seq_dir, args.no_override_intrinsics,
+            )
+            if not success:
+                log_msg(f"[WARN] ViPE inference failed")
+        except Exception as e:
+            log_msg(f"[ERR] Inference failed: {e}")
+
+        dur = int(time.time() - start_epoch)
+        log_msg(f"[TIME] Completed in {dur}s")
+        npz_path = find_pose_npz(raw_dir)
+    else:
+        if args.skip_infer:
+            log_msg("[SKIP] infer: --skip-infer specified")
+        elif npz_path:
+            log_msg(f"[SKIP] infer: {npz_path} already exists; use --reprocess to force")
+
+    # Copy groundtruth
+    gt_tum = os.path.join(out_seq_dir, "groundtruth.txt")
+    if args.reprocess or not os.path.exists(gt_tum):
+        log_msg(f"[GT] Copy {gt_txt} -> {gt_tum}")
+        shutil.copy2(gt_txt, gt_tum)
+    else:
+        log_msg(f"[SKIP] groundtruth.txt already exists")
+
+    # Convert poses to TUM
+    if npz_path:
+        if not os.path.exists(ts_csv):
+            log_msg(f"[ERR] Missing {ts_csv}")
+        else:
+            pred_out = os.path.join(out_seq_dir, "vipe_estimate_tum.txt")
+            if args.reprocess or not os.path.exists(pred_out):
+                log_msg(f"[PRED] Convert {npz_path} -> {pred_out}")
+                convert_npz_to_tum(npz_path, ts_csv, pred_out, args.poses_kind, seq_name)
+            else:
+                log_msg(f"[SKIP] {pred_out} already exists; use --reprocess to force")
+    else:
+        log_msg(f"[WARN] No npz found in {raw_dir}, skipping conversion.")
+
+
+def mirror_outputs(out_seq_dir, dest_seq_dir):
+    """Copy groundtruth and prediction files to the poses_and_groundtruth mirror."""
+    os.makedirs(dest_seq_dir, exist_ok=True)
+    for fname in ("groundtruth.txt", "vipe_estimate_tum.txt"):
+        src = os.path.join(out_seq_dir, fname)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest_seq_dir, fname))
+
+
+def evaluate_sequence(seq_name, out_seq_dir, dest_seq_dir, scale_correction, log_msg):
+    """Run evo evaluation for one sequence and mirror artefacts.
+
+    Returns the metrics dict, or None.
+    """
+    log_msg(f"[EVAL] Running evo evaluation for {seq_name}")
+    seq_metrics = run_evo_evaluation(out_seq_dir, scale_correction=scale_correction, seq_name=seq_name)
+    if seq_metrics:
+        log_msg(
+            f"[EVAL] RMSE={seq_metrics.get('rmse', 'N/A')}  "
+            f"Mean={seq_metrics.get('mean', 'N/A')}  "
+            f"Scale={seq_metrics.get('scale', 'N/A')}"
+        )
+        for evo_file in ('evo_metrics.json', 'evo_plot.png'):
+            src = os.path.join(out_seq_dir, evo_file)
+            if os.path.exists(src):
+                shutil.copy2(src, os.path.join(dest_seq_dir, evo_file))
+    else:
+        log_msg(f"[EVAL] No evo metrics produced for {seq_name}")
+    return seq_metrics
+
+
+def upload_sequence_outputs(out_seq_dir, dest_root, seq_name, args, s3_expname):
+    """Upload a processed sequence (and its mirror) to S3."""
+    s3_prefix_full = f"{args.s3_prefix}/{s3_expname}"
+    upload_sequence_to_s3(out_seq_dir, args.s3_bucket, s3_prefix_full, args.s3_profile, seq_name, logger)
+    dest_seq_s3 = os.path.join(dest_root, seq_name)
+    if os.path.isdir(dest_seq_s3):
+        upload_sequence_to_s3(
+            dest_seq_s3, args.s3_bucket,
+            f"{s3_prefix_full}/poses_and_groundtruth",
+            args.s3_profile, seq_name, logger,
+        )
+
+
+def process_sequence(seq_name, args, root_out, dest_root, s3_expname):
+    """Process a single sequence end-to-end: infer, convert, mirror, evaluate, upload.
+
+    Returns the evo metrics dict (or None) for the sequence.
+    """
+    seq_dir = os.path.join(args.input_root, seq_name)
+    img_dir = os.path.join(seq_dir, "images")
+    ts_csv = os.path.join(seq_dir, "timestamp.csv")
+    gt_txt = os.path.join(seq_dir, "groundtruth.txt")
+
+    if not os.path.isdir(img_dir):
+        logger.warning(f"[SKIP] {seq_name}: missing images/")
+        return None
+    if not os.path.isfile(gt_txt):
+        logger.warning(f"[SKIP] {seq_name}: missing groundtruth.txt")
+        return None
+
+    out_seq_dir = os.path.join(root_out, seq_name)
+    raw_dir = os.path.join(out_seq_dir, "vipe_raw")
+    os.makedirs(raw_dir, exist_ok=True)
+
+    main_log_file = os.path.join(out_seq_dir, "vipe_infer.log")
+    with open(main_log_file, "w") as f:
+        f.write(f"=== vipe_infer started at {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+    log_msg = make_log_fn(main_log_file)
+
+    log_msg("------------------------------------------------------------")
+    log_msg(f"[SEQ] {seq_name}")
+
+    # Run inference + conversion (chunked or unchunked)
+    if is_chunked_seq(seq_dir):
+        ok = process_chunked_sequence(seq_name, seq_dir, img_dir, gt_txt, raw_dir, out_seq_dir, args, log_msg)
+        if not ok:
+            return None
+    else:
+        process_unchunked_sequence(seq_name, seq_dir, img_dir, ts_csv, gt_txt, raw_dir, out_seq_dir, args, log_msg)
+
+    # Mirror outputs to poses_and_groundtruth/
+    dest_seq_dir = os.path.join(dest_root, seq_name)
+    mirror_outputs(out_seq_dir, dest_seq_dir)
+
+    # Evo evaluation (before upload so figures are included)
+    seq_metrics = None
+    if not args.no_eval:
+        seq_metrics = evaluate_sequence(seq_name, out_seq_dir, dest_seq_dir, args.scale_all, log_msg)
+
+    # Per-sequence S3 upload
+    if not args.no_s3_upload:
+        upload_sequence_outputs(out_seq_dir, dest_root, seq_name, args, s3_expname)
+
+    return seq_metrics
+
+
+# -------------------------------------------------------------------------
+# HIGH-LEVEL WORKFLOWS
+# -------------------------------------------------------------------------
+
+def build_filter_sets(args):
+    """Build the only/skip filter sets from CLI args and optional files."""
+    only_set = set(args.only)
+    if args.only_file and os.path.exists(args.only_file):
+        with open(args.only_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    only_set.add(line.strip())
+
+    skip_set = set(args.skip)
+    if args.skip_file and os.path.exists(args.skip_file):
+        with open(args.skip_file, 'r') as f:
+            for line in f:
+                if line.strip():
+                    skip_set.add(line.strip())
+
+    return only_set, skip_set
+
+
+def handle_upload_only(root_out, args, s3_expname):
+    """Handle --upload-only: upload existing output and exit."""
+    if not os.path.isdir(root_out):
+        logger.error(f"Output directory not found: {root_out}")
+        sys.exit(1)
+    s3_prefix = f"{args.s3_prefix}/{s3_expname}"
+    success = upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
+    sys.exit(0 if success else 1)
+
+
+def handle_eval_only(root_out, dest_root, args, s3_expname, only_set, skip_set):
+    """Handle --eval-only: re-run evo evaluation on existing outputs and exit."""
+    if not os.path.isdir(root_out):
+        logger.error(f"Output directory not found: {root_out}")
+        sys.exit(1)
+    os.makedirs(dest_root, exist_ok=True)
+    setup_evo_backend()
+
+    all_results = []
+    seq_dirs = sorted([
+        d for d in os.listdir(root_out)
+        if os.path.isdir(os.path.join(root_out, d)) and d != "poses_and_groundtruth"
+    ])
+    for seq_name in seq_dirs:
+        if only_set and seq_name not in only_set:
+            continue
+        if skip_set and seq_name in skip_set:
+            continue
+        out_seq_dir = os.path.join(root_out, seq_name)
+        metrics = run_evo_evaluation(out_seq_dir, scale_correction=args.scale_all, seq_name=seq_name)
+        if metrics:
+            all_results.append(metrics)
+            dest_seq_dir = os.path.join(dest_root, seq_name)
+            os.makedirs(dest_seq_dir, exist_ok=True)
+            for evo_file in ('evo_metrics.json', 'evo_plot.png', 'groundtruth.txt', 'vipe_estimate_tum.txt'):
+                src = os.path.join(out_seq_dir, evo_file)
+                if os.path.exists(src):
+                    shutil.copy2(src, os.path.join(dest_seq_dir, evo_file))
+
+    if all_results:
+        print_summary_table(all_results)
+        result_html = os.path.join(dest_root, "benchmark_results.html")
+        save_html_table(all_results, result_html)
+        combined_json = os.path.join(dest_root, "all_evo_metrics.json")
+        with open(combined_json, 'w') as f:
+            json.dump(all_results, f, indent=2)
+        if not args.no_s3_upload:
+            s3_prefix = f"{args.s3_prefix}/{s3_expname}"
+            upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
+        if args.browser and os.path.isfile(result_html):
+            open_html_in_browser(result_html)
+    else:
+        print("No evo metrics were collected from any sequence.")
+    sys.exit(0)
+
+
+def log_run_config(args, root_out):
+    """Print the run configuration summary."""
+    logger.info(f"[INFO] Input root: {args.input_root}")
+    logger.info(f"[INFO] Output root: {root_out}")
+    logger.info(f"[INFO] Pipeline: {args.pipeline}")
+    logger.info(f"[INFO] Visualize: {'ON' if args.visualize else 'OFF'}")
+    logger.info(f"[INFO] Poses-kind: {args.poses_kind} (twc = camera in world; tcw = invert)")
+    infer_mode = "SKIP ALL" if args.skip_infer else ("FORCE ALL" if args.reprocess else "IF MISSING")
+    logger.info(f"[INFO] Inference mode: {infer_mode}")
+    logger.info(f"[INFO] Verbose output: {'OFF' if args.quiet else 'ON'}")
+    logger.info(f"[INFO] Open browser: {'ON' if args.browser else 'OFF'}")
+    logger.info(f"[INFO] Scale-all APE: {'ON' if args.scale_all else 'OFF'}")
+    logger.info(f"[INFO] Evo eval: {'OFF' if args.no_eval else 'ON'}")
+    logger.info(f"[INFO] S3 upload: {'OFF' if args.no_s3_upload else 'ON'} (bucket={args.s3_bucket}, prefix={args.s3_prefix}, profile={args.s3_profile})")
+    logger.info(f"[INFO] PYTORCH_CUDA_ALLOC_CONF={ENV_VARS.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
+    logger.info(f"[INFO] Scanning for sequences with required files ...")
+
+
+def process_all_sequences(args, root_out, dest_root, s3_expname, only_set, skip_set):
+    """Iterate over all sequences, process each, and return collected evo results."""
+    if not os.path.isdir(args.input_root):
+        logger.error(f"Input root does not exist: {args.input_root}")
+        sys.exit(1)
+
+    sequences = sorted([
+        d for d in os.listdir(args.input_root)
+        if os.path.isdir(os.path.join(args.input_root, d))
+    ])
+
+    seq_count = 0
+    all_evo_results = []
+
+    for seq_name in sequences:
+        if only_set and seq_name not in only_set:
+            continue
+        if skip_set and seq_name in skip_set:
+            logger.info(f"[SKIP] {seq_name}: matched skip list")
+            continue
+
+        metrics = process_sequence(seq_name, args, root_out, dest_root, s3_expname)
+        if metrics is not None:
+            all_evo_results.append(metrics)
+        seq_count += 1
+
+    return seq_count, all_evo_results
+
+
+def finalize_results(all_evo_results, dest_root, args, root_out, s3_expname, seq_count, elapsed):
+    """Print summary, save HTML/JSON, and do final S3 sync."""
+    print("============================================================")
+    print(f"[DONE] Processed {seq_count} sequence(s) in {elapsed}s.")
+
+    if all_evo_results:
+        print_summary_table(all_evo_results)
+
+        result_html = os.path.join(dest_root, "benchmark_results.html")
+        save_html_table(all_evo_results, result_html)
+
+        combined_json = os.path.join(dest_root, "all_evo_metrics.json")
+        with open(combined_json, 'w') as f:
+            json.dump(all_evo_results, f, indent=2)
+        logger.info(f"  Combined metrics saved to: {combined_json}")
+
+        if args.browser and os.path.isfile(result_html):
+            open_html_in_browser(result_html)
+    elif not args.no_eval:
+        print("No evo metrics were collected from any sequence.")
+
+    # Final S3 sync (catches summary HTML, combined JSON & any stragglers;
+    # fast since per-sequence uploads already pushed the bulk of the data)
+    if not args.no_s3_upload:
+        s3_prefix = f"{args.s3_prefix}/{s3_expname}"
+        logger.info("\n[S3] Final sync (summary + catch-all)...")
+        upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
+    else:
+        logger.info("[INFO] S3 upload disabled (--no-s3-upload).")
+
+
+# -------------------------------------------------------------------------
+# ARGUMENT PARSING & MAIN ENTRY POINT
+# -------------------------------------------------------------------------
+
+def parse_args():
+    """Parse command-line arguments."""
     parser = argparse.ArgumentParser(description="ADI ViPE Runner & Benchmark")
     parser.add_argument('-e', '--expname', default="",
                         help='Experiment name used as the S3 subfolder under --s3-prefix '
@@ -564,12 +1378,16 @@ def main():
                         help="Force re-inference for all sequences (even if .npz exists)")
     parser.add_argument('--skip-infer', '--no-infer', action='store_true', dest='skip_infer',
                         help="Skip all inference; only post-process sequences with existing .npz")
-    
-    parser.add_argument('--bench-py', default=DEFAULT_BENCH_PY, help="Path to benchmark_dx.py")
+
     parser.add_argument('--browser', action='store_true', help="Open browser after benchmark (default: no browser)")
     parser.add_argument('-q', '--quiet', action='store_true', help="Suppress vipe inference output in terminal (still logs to file)")
-    parser.add_argument('--plots', action='store_true', dest='show_plots', help="Pass --plots to benchmark script")
-    parser.add_argument('--scale-all', action='store_true', help="Pass --scale-all to benchmark script")
+    parser.add_argument('--scale-all', action='store_true', help="Enable scale correction (-s) in evo_ape")
+
+    # Evaluation options
+    parser.add_argument('--no-eval', action='store_true',
+                        help='Disable evo trajectory evaluation (evo_ape/evo_traj)')
+    parser.add_argument('--eval-only', action='store_true',
+                        help='Skip inference, only run evo evaluation + summary on existing outputs')
 
     # Intrinsics override control
     parser.add_argument('--no-override-intrinsics', action='store_true', dest='no_override_intrinsics',
@@ -589,365 +1407,40 @@ def main():
     parser.add_argument('--upload-only', action='store_true',
                         help='Skip processing, just upload existing output folder to S3')
 
-    args = parser.parse_args()
+    return parser.parse_args()
 
-    # 1. Output Roots
-    # If --expname is set, append it to the output dir (e.g. ./output_vipe/adi_gt_intr/)
-    # so both local and S3 paths use the same experiment name.
-    if args.expname:
-        root_out = os.path.join(args.output_dir, args.expname)
-    else:
-        root_out = args.output_dir
+
+def main():
+    args = parse_args()
+
+    # Resolve output paths
+    root_out = os.path.join(args.output_dir, args.expname) if args.expname else args.output_dir
     s3_expname = args.expname if args.expname else os.path.basename(os.path.abspath(root_out))
-    
     dest_root = os.path.join(root_out, "poses_and_groundtruth")
 
-    # Handle --upload-only: skip all processing, just upload existing output
-    if args.upload_only:
-        if not os.path.isdir(root_out):
-            logger.error(f"Output directory not found: {root_out}")
-            sys.exit(1)
-        s3_prefix = f"{args.s3_prefix}/{s3_expname}"
-        success = upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
-        sys.exit(0 if success else 1)
+    # Build filter sets
+    only_set, skip_set = build_filter_sets(args)
 
+    # Early-exit modes
+    if args.upload_only:
+        handle_upload_only(root_out, args, s3_expname)
+    if args.eval_only:
+        handle_eval_only(root_out, dest_root, args, s3_expname, only_set, skip_set)
+
+    # Normal processing
     os.makedirs(root_out, exist_ok=True)
     os.makedirs(dest_root, exist_ok=True)
+    log_run_config(args, root_out)
 
-    # 2. Filter Lists
-    only_set = set(args.only)
-    if args.only_file and os.path.exists(args.only_file):
-        with open(args.only_file, 'r') as f:
-            for line in f:
-                if line.strip(): only_set.add(line.strip())
-    
-    skip_set = set(args.skip)
-    if args.skip_file and os.path.exists(args.skip_file):
-        with open(args.skip_file, 'r') as f:
-            for line in f:
-                if line.strip(): skip_set.add(line.strip())
-
-    # 3. Info Dump
-    logger.info(f"[INFO] Input root: {args.input_root}")
-    logger.info(f"[INFO] Output root: {root_out}")
-    logger.info(f"[INFO] Pipeline: {args.pipeline}")
-    logger.info(f"[INFO] Visualize: {'ON' if args.visualize else 'OFF'}")
-    logger.info(f"[INFO] Poses-kind: {args.poses_kind} (twc = camera in world; tcw = invert)")
-    infer_mode = "SKIP ALL" if args.skip_infer else ("FORCE ALL" if args.reprocess else "IF MISSING")
-    logger.info(f"[INFO] Inference mode: {infer_mode}")
-    logger.info(f"[INFO] Verbose output: {'OFF' if args.quiet else 'ON'}")
-    logger.info(f"[INFO] Benchmark py: {args.bench_py}")
-    logger.info(f"[INFO] Open browser: {'ON' if args.browser else 'OFF'}")
-    logger.info(f"[INFO] Scale-all APE: {'ON' if args.scale_all else 'OFF'}")
-    logger.info(f"[INFO] S3 upload: {'OFF' if args.no_s3_upload else 'ON'} (bucket={args.s3_bucket}, prefix={args.s3_prefix}, profile={args.s3_profile})")
-    logger.info(f"[INFO] PYTORCH_CUDA_ALLOC_CONF={ENV_VARS.get('PYTORCH_CUDA_ALLOC_CONF', '')}")
-    logger.info(f"[INFO] Scanning for sequences with required files ...")
+    if not args.no_eval:
+        setup_evo_backend()
 
     overall_start = time.time()
-    seq_count = 0
-    
-    # Get all subdirectories in input root
-    if not os.path.isdir(args.input_root):
-        logger.error(f"Input root does not exist: {args.input_root}")
-        sys.exit(1)
+    seq_count, all_evo_results = process_all_sequences(args, root_out, dest_root, s3_expname, only_set, skip_set)
+    elapsed = int(time.time() - overall_start)
 
-    sequences = sorted([d for d in os.listdir(args.input_root) if os.path.isdir(os.path.join(args.input_root, d))])
+    finalize_results(all_evo_results, dest_root, args, root_out, s3_expname, seq_count, elapsed)
 
-    for seq_name in sequences:
-        # Filter Logic
-        if only_set and seq_name not in only_set:
-            continue
-        if skip_set and seq_name in skip_set:
-            logger.info(f"[SKIP] {seq_name}: matched skip list")
-            continue
-
-        seq_dir = os.path.join(args.input_root, seq_name)
-        img_dir = os.path.join(seq_dir, "images")
-        ts_csv = os.path.join(seq_dir, "timestamp.csv")
-        gt_txt = os.path.join(seq_dir, "groundtruth.txt")
-
-        if not os.path.isdir(img_dir):
-            logger.warning(f"[SKIP] {seq_name}: missing images/")
-            continue
-        if not os.path.isfile(gt_txt):
-            logger.warning(f"[SKIP] {seq_name}: missing groundtruth.txt")
-            continue
-
-        # Prepare outputs
-        out_seq_dir = os.path.join(root_out, seq_name)
-        raw_dir = os.path.join(out_seq_dir, "vipe_raw")
-        os.makedirs(raw_dir, exist_ok=True)
-        
-        main_log_file = os.path.join(out_seq_dir, "vipe_infer.log")
-        # Ensure log exists
-        Path(main_log_file).touch()
-
-        def log_msg(msg):
-            print(msg)
-            with open(main_log_file, "a") as f:
-                f.write(msg + "\n")
-
-        log_msg("------------------------------------------------------------")
-        log_msg(f"[SEQ] {seq_name}")
-
-        chunked = is_chunked_seq(seq_dir)
-        
-        # ==================== CHUNKED MODE ====================
-        if chunked:
-            log_msg("[MODE] Chunked sequence detected.")
-            chunk_ids = get_chunk_ids(seq_dir)
-            if not chunk_ids:
-                log_msg(f"[ERR] No timestamp_*.csv found despite part folders. Skipping.")
-                continue
-
-            # Per-chunk processing
-            for cid in chunk_ids:
-                part_dir = os.path.join(img_dir, f"part_{cid}")
-                tsc = os.path.join(seq_dir, f"timestamp_{cid}.csv")
-                
-                if not os.path.isdir(part_dir) or not os.path.isfile(tsc):
-                    log_msg(f"[WARN] Missing inputs for chunk {cid}, skipping.")
-                    continue
-
-                raw_part = os.path.join(raw_dir, f"part_{cid}")
-                os.makedirs(raw_part, exist_ok=True)
-                part_log = os.path.join(out_seq_dir, f"vipe_infer_part_{cid}.log")
-                Path(part_log).touch()
-
-                # Determine if we need to run inference
-                # Check for existing npz
-                npz_path = find_pose_npz(raw_part)
-                
-                # Decide whether to run inference:
-                #   --skip-infer: never infer
-                #   --reprocess: always infer
-                #   default: infer only if npz missing
-                should_infer = False
-                if args.skip_infer:
-                    should_infer = False
-                elif args.reprocess:
-                    should_infer = True
-                elif not npz_path:
-                    should_infer = True
-
-                if should_infer:
-                    # Run Inference
-                    start_human = datetime.now().isoformat()
-                    start_epoch = time.time()
-                    
-                    with open(part_log, "a") as plog:
-                        plog.write(f"[TIME] start={start_human} epoch={int(start_epoch)}\n")
-                        plog.write(f"[ENV ] PYTORCH_CUDA_ALLOC_CONF={ENV_VARS.get('PYTORCH_CUDA_ALLOC_CONF', '')}\n")
-                        plog.write(f"[RUN]  Running ViPE inference on {part_dir}\n")
-                    
-                    log_msg(f"[RUN] Running ViPE inference on {part_dir}")
-                    
-                    try:
-                        success = run_vipe_inference(part_dir, raw_part, args.pipeline, args.visualize, seq_dir, args.no_override_intrinsics)
-                        if not success:
-                            log_msg(f"[WARN] ViPE inference failed")
-                            with open(part_log, "a") as plog:
-                                plog.write(f"[WARN] ViPE inference failed\n")
-                    except Exception as e:
-                        with open(part_log, "a") as plog:
-                            plog.write(f"[ERR] Exception during inference: {e}\n")
-                        log_msg(f"[ERR] Exception during inference: {e}")
-
-                    end_human = datetime.now().isoformat()
-                    end_epoch = time.time()
-                    dur = int(end_epoch - start_epoch)
-                    with open(part_log, "a") as plog:
-                        plog.write(f"[TIME] end={end_human} epoch={int(end_epoch)} duration_s={dur}\n")
-                    log_msg(f"[TIME] Completed in {dur}s")
-
-                    npz_path = find_pose_npz(raw_part)
-                else:
-                    if args.skip_infer:
-                        msg = f"[SKIP] part_{cid} infer: --skip-infer specified"
-                    elif npz_path:
-                        msg = f"[SKIP] part_{cid} infer: npz exists ({npz_path}); use --reprocess to force"
-                    else:
-                        msg = f"[SKIP] part_{cid} infer: no npz and inference not requested"
-                    log_msg(msg)
-                    with open(part_log, "a") as plog: plog.write(msg + "\n")
-
-                # Convert to TUM
-                partial_out = os.path.join(out_seq_dir, f"vipe_estimate_tum_part_{cid}.txt")
-                if npz_path:
-                    if args.reprocess or not os.path.exists(partial_out):
-                        log_msg(f"[PRED-part] Convert {npz_path} -> {partial_out}")
-                        success = convert_npz_to_tum(npz_path, tsc, partial_out, args.poses_kind, f"{seq_name}:part_{cid}")
-                        if not success:
-                            log_msg(f"[WARN] part_{cid} conversion failed.")
-                    else:
-                        with open(part_log, "a") as plog: plog.write(f"[SKIP] conversion: {partial_out} exists\n")
-                else:
-                    with open(part_log, "a") as plog: plog.write(f"[WARN] No npz to convert for part_{cid}\n")
-
-            # Stitching Logic
-            gt_tum = os.path.join(out_seq_dir, "groundtruth.txt")
-            log_msg(f"[GT] Copy {gt_txt} -> {gt_tum}")
-            shutil.copy2(gt_txt, gt_tum)
-
-            pred_out = os.path.join(out_seq_dir, "vipe_estimate_tum.txt")
-            
-            # Stitch files
-            with open(pred_out, "w") as fout:
-                fout.write("# ViPE predicted trajectory (TUM format)\n")
-                fout.write(f"# sequence: '{seq_name}' (stitched)\n")
-                fout.write("# columns: timestamp tx ty tz qx qy qz qw\n")
-                
-                appended_count = 0
-                all_lines = []
-                for cid in chunk_ids:
-                    part_f = os.path.join(out_seq_dir, f"vipe_estimate_tum_part_{cid}.txt")
-                    if os.path.exists(part_f):
-                        with open(part_f, "r") as fin:
-                            for line in fin:
-                                if not line.startswith('#'):
-                                    all_lines.append(line.strip())
-                        appended_count += 1
-                    else:
-                        log_msg(f"[WARN] Missing partial file for part_{cid}")
-
-                # Monotonic Sort
-                # Parse lines to (timestamp, full_line) tuples
-                parsed_lines = []
-                for l in all_lines:
-                    parts = l.split()
-                    if parts:
-                        try:
-                            parsed_lines.append((float(parts[0]), l))
-                        except ValueError:
-                            pass
-                
-                # Sort by timestamp
-                parsed_lines.sort(key=lambda x: x[0])
-                
-                for _, line in parsed_lines:
-                    fout.write(line + "\n")
-            
-            if appended_count > 0:
-                log_msg(f"[OK] Stitched {appended_count} chunk(s) into {pred_out}")
-            else:
-                log_msg(f"[WARN] No partial predictions stitched for {seq_name}; final prediction missing.")
-                # Remove empty file like shell script does
-                try:
-                    os.remove(pred_out)
-                except OSError:
-                    pass
-
-        # ==================== UNCHUNKED MODE ====================
-        else:
-            log_msg("[MODE] Unchunked sequence.")
-            
-            # Check for existing npz
-            npz_path = find_pose_npz(raw_dir)
-            
-            # Decide whether to run inference:
-            #   --skip-infer: never infer
-            #   --reprocess: always infer  
-            #   default: infer only if npz missing
-            should_infer = False
-            if args.skip_infer:
-                log_msg("[SKIP] infer: --skip-infer specified")
-            elif args.reprocess:
-                should_infer = True
-            elif npz_path:
-                log_msg(f"[SKIP] infer: {npz_path} already exists; use --reprocess to force")
-            else:
-                should_infer = True
-
-            if should_infer:
-                log_msg(f"[RUN] Running ViPE inference on {img_dir}")
-                start_epoch = time.time()
-                
-                try:
-                    success = run_vipe_inference(img_dir, raw_dir, args.pipeline, args.visualize, seq_dir, args.no_override_intrinsics)
-                    if not success:
-                        log_msg(f"[WARN] ViPE inference failed")
-                except Exception as e:
-                    log_msg(f"[ERR] Inference failed: {e}")
-                
-                dur = int(time.time() - start_epoch)
-                log_msg(f"[TIME] Completed in {dur}s")
-
-                npz_path = find_pose_npz(raw_dir)
-
-            # Post-Process
-            gt_tum = os.path.join(out_seq_dir, "groundtruth.txt")
-            log_msg(f"[GT] Copy {gt_txt} -> {gt_tum}")
-            shutil.copy2(gt_txt, gt_tum)
-
-            if npz_path:
-                if not os.path.exists(ts_csv):
-                    log_msg(f"[ERR] Missing {ts_csv}")
-                else:
-                    pred_out = os.path.join(out_seq_dir, "vipe_estimate_tum.txt")
-                    log_msg(f"[PRED] Convert {npz_path} -> {pred_out}")
-                    convert_npz_to_tum(npz_path, ts_csv, pred_out, args.poses_kind, seq_name)
-            else:
-                log_msg(f"[WARN] No npz found in {raw_dir}, skipping conversion.")
-
-        # ==================== MIRRORING ====================
-        dest_seq_dir = os.path.join(dest_root, seq_name)
-        os.makedirs(dest_seq_dir, exist_ok=True)
-        
-        src_gt = os.path.join(out_seq_dir, "groundtruth.txt")
-        src_pred = os.path.join(out_seq_dir, "vipe_estimate_tum.txt")
-        
-        if os.path.exists(src_gt):
-            shutil.copy2(src_gt, os.path.join(dest_seq_dir, "groundtruth.txt"))
-        if os.path.exists(src_pred):
-            shutil.copy2(src_pred, os.path.join(dest_seq_dir, "vipe_estimate_tum.txt"))
-
-        seq_count += 1
-
-    # 4. Benchmarking
-    overall_dur = int(time.time() - overall_start)
-    print("============================================================")
-    print(f"[DONE] Processed {seq_count} sequence(s) in {overall_dur}s.")
-
-    result_html = os.path.join(dest_root, "benchmark_results.html")
-    
-    if os.path.isfile(args.bench_py):
-        print(f"Running benchmark: {args.bench_py}")
-        bench_cmd = [sys.executable, args.bench_py, dest_root]
-        if args.show_plots: bench_cmd.append("--plots")
-        if args.scale_all: bench_cmd.append("--scale-all")
-        if only_set:
-            for item in only_set:
-                bench_cmd.extend(["--plot-only", item])
-        
-        try:
-            subprocess.run(bench_cmd, check=False)
-        except Exception as e:
-            print(f"Warning: benchmark execution failed: {e}")
-
-        # Check for result HTML
-        final_html = None
-        if os.path.isfile(result_html):
-            final_html = result_html
-        else:
-            # Fallback search
-            candidates = glob.glob(os.path.join(dest_root, "*.html"))
-            if candidates:
-                final_html = candidates[0]
-        
-        if final_html:
-            print(f"Opening: {final_html}")
-            open_html_in_browser(final_html, no_browser=not args.browser)
-        else:
-            print(f"No HTML results found in {dest_root}")
-    else:
-        print(f"Benchmark script not found at {args.bench_py} - skipping.")
-
-    # 5. S3 Upload (enabled by default, runs after benchmarking so results are included)
-    if not args.no_s3_upload:
-        s3_prefix = f"{args.s3_prefix}/{s3_expname}"
-        upload_to_s3(root_out, args.s3_bucket, s3_prefix, args.s3_profile)
-    else:
-        logger.info("[INFO] S3 upload disabled (--no-s3-upload).")
 
 if __name__ == "__main__":
     main()
